@@ -6,7 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -22,6 +24,8 @@ import tech.ydb.table.values.PrimitiveValue;
 import tech.ydb.topic.TopicClient;
 import tech.ydb.topic.read.SyncReader;
 import tech.ydb.topic.settings.ReaderSettings;
+import tech.ydb.topic.settings.ReceiveSettings;
+import tech.ydb.topic.settings.SendSettings;
 import tech.ydb.topic.settings.TopicReadSettings;
 import tech.ydb.topic.settings.WriterSettings;
 import tech.ydb.topic.write.Message;
@@ -43,13 +47,6 @@ public class Application {
 
             createSchema(retryCtx);
 
-            var writer = topicClient.createSyncWriter(
-                    WriterSettings.newBuilder()
-                            .setProducerId("producer-file")
-                            .setTopicPath("file_topic")
-                            .build()
-            );
-
             var reader = topicClient.createSyncReader(
                     ReaderSettings.newBuilder()
                             .setConsumerName("file_consumer")
@@ -57,12 +54,10 @@ public class Application {
                             .build()
             );
 
-            writer.init();
             reader.init();
 
             var stopped_read_process = new AtomicBoolean();
-
-            var readerJob = CompletableFuture.runAsync(() -> runReadJob(stopped_read_process, reader, retryCtx));
+            var readerJob = CompletableFuture.runAsync(() -> runTransactionReadJob(stopped_read_process, reader, retryCtx));
 
             String currentDirectory = System.getProperty("user.dir");
             var pathFile = Path.of(currentDirectory, PATH);
@@ -88,59 +83,92 @@ public class Application {
                 var lineNumber = new AtomicLong(lineNumberLong);
                 var origLineNumber = new AtomicLong(1);
 
-                lines.forEach(line ->
-                        {
+                lines.forEach(line -> {
                             if (origLineNumber.getAndIncrement() < lineNumber.get()) {
                                 return;
                             }
 
-                            writer.send(Message.newBuilder()
-                                    .setSeqNo(lineNumber.getAndIncrement())
-                                    .setData((PATH + ":" + line).getBytes(StandardCharsets.UTF_8))
-                                    .build()
-                            );
-                            writer.flush();
+                            var lineNumberCur = lineNumber.getAndIncrement();
+                            retryCtx.supplyStatus(
+                                    session -> {
+                                        var transaction = session.beginTransaction(TxMode.SERIALIZABLE_RW).join().getValue();
+                                        var writer = topicClient.createSyncWriter(
+                                                WriterSettings.newBuilder()
+                                                        .setProducerId("producer-file")
+                                                        .setTopicPath("file_topic")
+                                                        .build()
+                                        );
+                                        writer.initAndWait();
 
-                            retryCtx.supplyResult(
-                                    session -> session.createQuery("""
-                                                    DECLARE $name AS Text;
-                                                    DECLARE $line_num AS Int64;
-                                                                                            
-                                                    UPDATE write_file_progress SET line_num = $line_num
-                                                    WHERE name = $name;
-                                                    """,
-                                            TxMode.SERIALIZABLE_RW,
-                                            Params.of("$name", PrimitiveValue.newText(pathFile.toString()),
-                                                    "$line_num", PrimitiveValue.newInt64(lineNumber.get()))
-                                    ).execute()
-                            ).join().getStatus().expectSuccess();
+                                        writer.send(
+                                                Message.newBuilder()
+                                                        .setSeqNo(lineNumberCur)
+                                                        .setData((PATH + ":" + line).getBytes(StandardCharsets.UTF_8))
+                                                        .build(),
+                                                SendSettings.newBuilder().setTransaction(transaction).build()
+                                        );
+                                        writer.flush();
+
+                                        transaction.createQuery("""
+                                                        DECLARE $name AS Text;
+                                                        DECLARE $line_num AS Int64;
+                                                                                                
+                                                        UPDATE write_file_progress SET line_num = $line_num
+                                                        WHERE name = $name;
+                                                        """,
+                                                Params.of("$name", PrimitiveValue.newText(pathFile.toString()),
+                                                        "$line_num", PrimitiveValue.newInt64(lineNumber.get()))
+                                        ).execute();
+
+                                        transaction.commit().join();
+
+                                        try {
+                                            writer.shutdown(10, TimeUnit.SECONDS);
+                                        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                                            throw new RuntimeException(e);
+                                        }
+
+                                        return CompletableFuture.completedFuture(Status.SUCCESS);
+                                    }
+                            ).join().expectSuccess();
                         }
                 );
             }
 
             Thread.sleep(5_000);
             stopped_read_process.set(true);
-            printTableFile(retryCtx);
-
             readerJob.join();
+
+            printTableFile(retryCtx);
 
             dropSchema(retryCtx);
         }
     }
 
-    private static void runReadJob(AtomicBoolean stopped_read_process, SyncReader reader, SessionRetryContext retryCtx) {
+    private static void runTransactionReadJob(AtomicBoolean stopped_read_process, SyncReader reader, SessionRetryContext retryCtx) {
         System.out.println("Started read worker!");
 
         while (!stopped_read_process.get()) {
             try {
-                var message = reader.receive(1, TimeUnit.SECONDS);
-
-                if (message == null) {
-                    continue;
-                }
-
                 retryCtx.supplyStatus(session -> {
-                    var tx = session.createNewTransaction(TxMode.SERIALIZABLE_RW);
+                    var tx = session.beginTransaction(TxMode.SERIALIZABLE_RW).join().getValue();
+
+                    tech.ydb.topic.read.Message message;
+                    try {
+                        message = reader.receive(ReceiveSettings.newBuilder()
+                                .setTransaction(tx)
+                                .setTimeout(1, TimeUnit.SECONDS)
+                                .build()
+                        );
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+
+                    if (message == null) {
+                        tx.rollback().join();
+                        return CompletableFuture.completedFuture(Status.SUCCESS);
+                    }
+
                     var partitionId = message.getPartitionSession().getPartitionId();
 
                     var queryReader = QueryReader.readFrom(
@@ -154,14 +182,6 @@ public class Application {
 
                     var resultSet = queryReader.getResultSet(0);
                     var lastOffset = resultSet.next() ? resultSet.getColumn(0).getInt64() : 0;
-
-                    if (lastOffset > message.getOffset()) {
-                        message.commit().join();
-                        tx.rollback().join();
-
-                        return CompletableFuture.completedFuture(Status.SUCCESS);
-                    }
-
                     var messageData = new String(message.getData(), StandardCharsets.UTF_8).split(":");
                     var name = messageData[0];
                     var length = messageData[1].length();
@@ -181,7 +201,7 @@ public class Application {
                             )
                     ).execute().join().getStatus().expectSuccess();
 
-                    tx.createQueryWithCommit(
+                    tx.createQuery(
                             """
                                         DECLARE $partition_id AS Int64;
                                         DECLARE $last_offset AS Int64;
@@ -193,7 +213,7 @@ public class Application {
                             )
                     ).execute().join().getStatus().expectSuccess();
 
-                    message.commit().join();
+                    tx.commit().join();
 
                     return CompletableFuture.completedFuture(Status.SUCCESS);
                 }).join().expectSuccess();
@@ -236,13 +256,13 @@ public class Application {
                     last_offset Int64 NOT NULL,
                     PRIMARY KEY (partition_id)
                 );
-                                
+                           
                 CREATE TABLE write_file_progress (
                     name Text NOT NULL,
                     line_num Int64 NOT NULL,
                     PRIMARY KEY (name)
                 );
-                                                    
+                           
                 CREATE TOPIC file_topic (
                     CONSUMER file_consumer
                 ) WITH(

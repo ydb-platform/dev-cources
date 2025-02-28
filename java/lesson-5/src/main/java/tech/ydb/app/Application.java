@@ -151,7 +151,7 @@ public class Application {
 
         public void updateStatus(UUID id, String status) {
             retryCtx.supplyResult(
-                    session -> QueryReader.readFrom(session.createQuery(
+                    session -> session.createQuery(
                             """
                                     DECLARE $id AS UUID;
                                     DECLARE $new_status AS Text;
@@ -163,8 +163,8 @@ public class Application {
                             TxMode.SERIALIZABLE_RW,
                             Params.of("$id", PrimitiveValue.newUuid(id),
                                     "$new_status", PrimitiveValue.newText(status))
-                    ))
-            ).join().getValue();
+                    ).execute()
+            ).join().getStatus().expectSuccess();
         }
 
         public void createSchema() {
